@@ -1571,7 +1571,8 @@ syncprov_op_cleanup( Operation *op, SlapReply *rs )
 	if ( mt ) {
 		modinst *mi = (modinst *)(opc+1), **m2;
 		ldap_pvt_thread_mutex_lock( &mt->mt_mutex );
-		for (m2 = &mt->mt_mods; ; m2 = &(*m2)->mi_next) {
+		/* Do not assume mi is still in the list */
+		for (m2 = &mt->mt_mods; *m2; m2 = &(*m2)->mi_next) {
 			if ( *m2 == mi ) {
 				*m2 = mi->mi_next;
 				if ( mt->mt_tail == mi )
@@ -1583,13 +1584,25 @@ syncprov_op_cleanup( Operation *op, SlapReply *rs )
 		if ( mt->mt_mods ) {
 			ldap_pvt_thread_mutex_unlock( &mt->mt_mutex );
 		} else {
+			modtarget *mt_gone;
+
 			ldap_pvt_thread_mutex_unlock( &mt->mt_mutex );
 			ldap_pvt_thread_mutex_lock( &si->si_mods_mutex );
-			ldap_avl_delete( &si->si_mods, mt, sp_avl_cmp );
+			mt_gone = ldap_avl_delete( &si->si_mods, mt, sp_avl_cmp );
 			ldap_pvt_thread_mutex_unlock( &si->si_mods_mutex );
-			ldap_pvt_thread_mutex_destroy( &mt->mt_mutex );
-			ch_free( mt->mt_dn.bv_val );
-			ch_free( mt );
+			/* Only free what we removed: freeing a target still linked in
+			 * si_mods leaves the tree dereferencing freed memory on every
+			 * later traversal.
+			 */
+			if ( mt_gone == mt ) {
+				ldap_pvt_thread_mutex_destroy( &mt->mt_mutex );
+				ch_free( mt->mt_dn.bv_val );
+				ch_free( mt );
+			} else {
+				Debug( LDAP_DEBUG_ANY, "syncprov_op_cleanup: "
+					"modtarget \"%s\" not removed from si_mods, leaking it\n",
+					mt->mt_dn.bv_val ? mt->mt_dn.bv_val : "" );
+			}
 		}
 	}
 	if ( !BER_BVISNULL( &opc->suuid ))
@@ -1783,8 +1796,18 @@ syncprov_add_slog( Operation *op )
 						op->o_log_prefix, se->se_sid, sl->sl_mincsn[i].bv_val, se->se_csn.bv_val );
 					ber_bvreplace( &sl->sl_mincsn[i], &se->se_csn );
 				}
-				ldap_tavl_delete( &sl->sl_entries, se, syncprov_sessionlog_cmp );
-				ch_free( se );
+				/* Only free what we removed, else the tree keeps
+				 * dereferencing freed memory on later traversals.
+				 */
+				if ( ldap_tavl_delete( &sl->sl_entries, se,
+						syncprov_sessionlog_cmp ) == se ) {
+					ch_free( se );
+				} else {
+					Debug( LDAP_DEBUG_ANY, "%s syncprov_add_slog: "
+						"sessionlog csn=%s not removed, leaking it\n",
+						op->o_log_prefix,
+						se->se_csn.bv_val ? se->se_csn.bv_val : "" );
+				}
 				edge = next;
 				sl->sl_num--;
 			}
@@ -2832,7 +2855,8 @@ retry:
 				if ( op->o_abandon ) {
 					modinst **m2;
 					slap_callback **sc;
-					for (m2 = &mt->mt_mods; ; m2 = &(*m2)->mi_next) {
+					/* Do not assume mi is still in the list */
+					for (m2 = &mt->mt_mods; *m2; m2 = &(*m2)->mi_next) {
 						if ( *m2 == mi ) {
 							*m2 = mi->mi_next;
 							if ( mt->mt_tail == mi )
@@ -2840,7 +2864,8 @@ retry:
 							break;
 						}
 					}
-					for (sc = &op->o_callback; ; sc = &(*sc)->sc_next) {
+					/* Likewise cb: the stack may already have been unwound */
+					for (sc = &op->o_callback; *sc; sc = &(*sc)->sc_next) {
 						if ( *sc == cb ) {
 							*sc = cb->sc_next;
 							break;
@@ -2859,7 +2884,15 @@ retry:
 			mt->mt_tail = mi;
 			ber_dupbv( &mt->mt_dn, &mi->mi_op->o_req_ndn );
 			ldap_pvt_thread_mutex_init( &mt->mt_mutex );
-			ldap_avl_insert( &si->si_mods, mt, sp_avl_cmp, ldap_avl_dup_error );
+			/* A failed insert leaves mt unreferenced by the tree while the op
+			 * still points at it, so cleanup can find nothing to remove.
+			 */
+			if ( ldap_avl_insert( &si->si_mods, mt, sp_avl_cmp,
+					ldap_avl_dup_error ) ) {
+				Debug( LDAP_DEBUG_ANY, "syncprov_op_mod: "
+					"modtarget \"%s\" not inserted into si_mods\n",
+					mt->mt_dn.bv_val ? mt->mt_dn.bv_val : "" );
+			}
 			ldap_pvt_thread_mutex_unlock( &si->si_mods_mutex );
 		}
 		opc->smt = mt;
