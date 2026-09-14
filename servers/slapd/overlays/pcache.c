@@ -1695,11 +1695,26 @@ remove_from_template (CachedQuery* qc, QueryTemplate* template)
 		qc->next->prev = qc->prev;
 		qc->prev->next = qc->next;
 	}
-	ldap_tavl_delete( &qc->qbase->scopes[qc->scope], qc, pcache_query_cmp );
+	/* The caller frees qc later, so a failed removal leaves the scope tree
+	 * dereferencing freed memory on every later traversal.
+	 */
+	if ( ldap_tavl_delete( &qc->qbase->scopes[qc->scope], qc,
+			pcache_query_cmp ) != qc ) {
+		Debug( LDAP_DEBUG_ANY, "pcache: query for base \"%s\" "
+			"not removed from its scope tree\n",
+			qc->qbase->base.bv_val ? qc->qbase->base.bv_val : "" );
+	}
 	qc->qbase->queries--;
 	if ( qc->qbase->queries == 0 ) {
-		ldap_avl_delete( &template->qbase, qc->qbase, pcache_dn_cmp );
-		ch_free( qc->qbase );
+		/* Only free what we removed, same reason as above */
+		if ( ldap_avl_delete( &template->qbase, qc->qbase,
+				pcache_dn_cmp ) == qc->qbase ) {
+			ch_free( qc->qbase );
+		} else {
+			Debug( LDAP_DEBUG_ANY, "pcache: qbase \"%s\" not removed from "
+				"template, leaking it\n",
+				qc->qbase->base.bv_val ? qc->qbase->base.bv_val : "" );
+		}
 		qc->qbase = NULL;
 	}
 
