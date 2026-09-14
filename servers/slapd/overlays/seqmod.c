@@ -62,7 +62,18 @@ seqmod_op_cleanup( Operation *op, SlapReply *rs )
 	/* This op is done, remove it */
 	ldap_pvt_thread_mutex_lock( &sm->sm_mutex );
 	av = ldap_avl_find2( sm->sm_mods, &mtdummy, sm_avl_cmp );
-	assert(av != NULL);
+	/* Do not assume the target is still there: the assert is compiled out
+	 * under NDEBUG and the dereference below would fault instead.
+	 */
+	if ( av == NULL ) {
+		Debug( LDAP_DEBUG_ANY, "seqmod_op_cleanup: "
+			"no modtarget for \"%s\"\n",
+			op->o_req_ndn.bv_val ? op->o_req_ndn.bv_val : "" );
+		ldap_pvt_thread_mutex_unlock( &sm->sm_mutex );
+		op->o_callback = sc->sc_next;
+		op->o_tmpfree( sc, op->o_tmpmemctx );
+		return 0;
+	}
 
 	mt = av->avl_data;
 
@@ -70,8 +81,10 @@ seqmod_op_cleanup( Operation *op, SlapReply *rs )
 	if ( mt->mt_next ) {
 		av->avl_data = mt->mt_next;
 		mt->mt_next->mt_tail = mt->mt_tail;
-	} else {
-		ldap_avl_delete( &sm->sm_mods, mt, sm_avl_cmp );
+	} else if ( ldap_avl_delete( &sm->sm_mods, mt, sm_avl_cmp ) == NULL ) {
+		Debug( LDAP_DEBUG_ANY, "seqmod_op_cleanup: "
+			"modtarget for \"%s\" not removed\n",
+			op->o_req_ndn.bv_val ? op->o_req_ndn.bv_val : "" );
 	}
 	ldap_pvt_thread_mutex_unlock( &sm->sm_mutex );
 	op->o_callback = sc->sc_next;
